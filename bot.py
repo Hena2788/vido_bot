@@ -1,10 +1,11 @@
 import os
 import logging
 import time
+import threading
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-
+from flask import Flask
 import yt_dlp
 from pathlib import Path
 
@@ -25,10 +26,21 @@ DOWNLOADS_DIR.mkdir(exist_ok=True)
 MAX_RETRIES = 2
 REQUEST_DELAY = 1.5  # seconds
 
+# Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/healthz')
+def health_check():
+    """Endpoint for Render health checks"""
+    return "OK", 200
+
+def run_flask_app():
+    """Run Flask in a separate thread"""
+    app.run(host='0.0.0.0', port=5000)
+
 async def send_video(update: Update, video_path: Path, caption=""):
     """Enhanced video sending with better error handling"""
     try:
-        # Verify file exists and is valid
         if not video_path.exists():
             raise FileNotFoundError("Video file not found")
             
@@ -51,7 +63,6 @@ async def send_video(update: Update, video_path: Path, caption=""):
         await update.message.reply_text("❌ Failed to send video. Please try again.")
         return False
     finally:
-        # Clean up file whether send succeeded or failed
         try:
             video_path.unlink(missing_ok=True)
         except Exception as e:
@@ -79,7 +90,6 @@ def download_with_ytdlp(url, output_path, retry=0):
             info = ydl.extract_info(url, download=True)
             downloaded_file = Path(ydl.prepare_filename(info))
             
-            # Ensure MP4 format
             if downloaded_file.suffix != '.mp4':
                 new_path = downloaded_file.with_suffix('.mp4')
                 downloaded_file.rename(new_path)
@@ -89,7 +99,7 @@ def download_with_ytdlp(url, output_path, retry=0):
     except yt_dlp.utils.DownloadError as e:
         if retry < MAX_RETRIES:
             logger.warning(f"Retry {retry + 1} for {url}")
-            time.sleep(2)  # Wait before retrying
+            time.sleep(2)
             return download_with_ytdlp(url, output_path, retry + 1)
         logger.error(f"Download failed after {MAX_RETRIES} retries: {str(e)}")
         return None
@@ -100,9 +110,8 @@ def download_with_ytdlp(url, output_path, retry=0):
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Improved link handler with better feedback"""
     url = update.message.text.strip()
-    time.sleep(REQUEST_DELAY)  # Rate limiting
+    time.sleep(REQUEST_DELAY)
     
-    # Platform detection
     if "instagram.com" in url:
         platform = "Instagram"
         await update.message.reply_text("📥 Downloading Instagram video...")
@@ -119,7 +128,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔗 Please send a valid Instagram, TikTok, or YouTube link.")
         return
 
-    # Handle download result
     if video_path and video_path.exists():
         await send_video(update, video_path, f"🎥 {platform} Video")
     else:
@@ -146,12 +154,17 @@ def main():
     if not TOKEN:
         raise ValueError("Bot token not found. Check your .env file.")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask_app)
+    flask_thread.daemon = True
+    flask_thread.start()
 
+    # Start Telegram bot
+    app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    logger.info("🚀 Bot is running...")
+    logger.info("🚀 Bot is running with health check at http://0.0.0.0:5000/healthz")
     app.run_polling()
 
 if __name__ == '__main__':
